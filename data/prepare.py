@@ -63,6 +63,29 @@ def fineweb_edu_stream():  # pragma: no cover - exercised only with `datasets` i
         yield row["text"]
 
 
+def fineweb_raw_stream():  # pragma: no cover - exercised only with `datasets` installed
+    """Raw (unfiltered) FineWeb — the data-quality NEGATIVE lever for B6.
+    Same web corpus as FineWeb-Edu without the edu-classifier filtering."""
+    from datasets import load_dataset
+
+    ds = load_dataset(
+        "HuggingFaceFW/fineweb",
+        name="sample-10BT",
+        split="train",
+        streaming=True,
+    )
+    for row in ds:
+        yield row["text"]
+
+
+def _source_stream(source: str, seed: int):
+    if source == "synthetic":
+        return synthetic_stream(seed)
+    if source == "fineweb-raw":
+        return fineweb_raw_stream()
+    return fineweb_edu_stream()  # "fineweb-edu" (default)
+
+
 def tokenize_into_shards(
     out_dir: Path,
     shard_tokens: int,
@@ -76,7 +99,7 @@ def tokenize_into_shards(
     import time as _time
 
     tok = get_tokenizer()
-    stream = synthetic_stream(seed) if source == "synthetic" else fineweb_edu_stream()
+    stream = _source_stream(source, seed)
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     buf: list[int] = []
@@ -144,7 +167,7 @@ def tokenize_into_shards(
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--source", choices=["synthetic", "fineweb-edu"], default="synthetic")
+    p.add_argument("--source", choices=["synthetic", "fineweb-edu", "fineweb-raw"], default="synthetic")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--shard-tokens", type=int, default=100_000)
     p.add_argument("--total-tokens", type=int, default=500_000)
@@ -183,6 +206,12 @@ def main() -> None:
         print(f"eval shard: {eval_path}")
     print(f"manifest: {manifest_path}")
     print(f"manifest hash: {manifest.manifest_hash()[:16]}…")
+    # HF `datasets`/tokenizers background threads can fault during interpreter
+    # finalization (PyGILState_Release). The work is done + files are written, so
+    # exit hard before that cleanup runs.
+    import os as _os
+    sys.stdout.flush(); sys.stderr.flush()
+    _os._exit(0)
 
 
 if __name__ == "__main__":

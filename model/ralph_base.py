@@ -37,6 +37,13 @@ class RalphConfig:
     init_std: float = 0.02
     tie_embeddings: bool = True
 
+    # --- Recipe levers (B6 transfer-credibility experiment) ---
+    # Each default reproduces the verified baseline byte-for-byte.
+    pos_encoding: str = "rope"        # "rope" | "nope" | "learned"
+    mlp_activation: str = "swiglu"    # "swiglu" | "relu2" | "gelu"
+    qk_norm: bool = False             # per-head RMSNorm on q,k before RoPE/attn
+    residual_init_scale: bool = True  # GPT-2 depth-scaled residual-out init
+
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     dtype = x.dtype
@@ -90,11 +97,18 @@ class Attention(nn.Module):
         self.n_heads = cfg.n_heads
         self.head_dim = cfg.head_dim
         self.dim = cfg.dim
+        self.pos_encoding = cfg.pos_encoding
+        self.qk_norm = cfg.qk_norm
         assert cfg.dim == cfg.n_heads * cfg.head_dim, "dim must equal n_heads * head_dim"
         self.qkv = nn.Linear(cfg.dim, 3 * cfg.dim, bias=False)
         self.out_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
         # Mark as residual-path output for depth-scaled init (GPT-2 §2.3).
         self.out_proj._is_residual_out = True
+        # QK-norm: per-head RMSNorm over head_dim, applied before RoPE/attn.
+        # Disabled by default -> identical to baseline.
+        if cfg.qk_norm:
+            self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
+            self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -103,8 +117,14 @@ class Attention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, T, hd)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        q = apply_rope(q, rope_cache)
-        k = apply_rope(k, rope_cache)
+        # QK-norm operates per-head over head_dim (last axis), before RoPE.
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        # RoPE only when pos_encoding == "rope". "nope"/"learned" skip it.
+        if self.pos_encoding == "rope":
+            q = apply_rope(q, rope_cache)
+            k = apply_rope(k, rope_cache)
         # Causal self-attention via SDPA (uses flash on supported hardware).
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -127,13 +147,49 @@ class SwiGLU(nn.Module):
         return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
 
 
+class GatedMLP(nn.Module):
+    """Standard 2-layer MLP: up(dim->hidden) -> act -> down(hidden->dim).
+
+    Used for the "relu2" (squared-ReLU) and "gelu" levers. SwiGLU uses three
+    dim x hidden matrices (gate, up, down) for 3*dim*hidden params; a 2-matrix
+    MLP matches that param count when hidden = ffn_mult * dim * 3/2. We round
+    to a multiple of 64 to match SwiGLU's kernel-friendly rounding.
+    """
+
+    def __init__(self, cfg: RalphConfig, activation: str):
+        super().__init__()
+        hidden = int(round(cfg.dim * cfg.ffn_mult * 1.5))
+        hidden = 64 * ((hidden + 63) // 64)
+        self.up = nn.Linear(cfg.dim, hidden, bias=False)
+        self.down = nn.Linear(hidden, cfg.dim, bias=False)
+        # Mark as residual-path output for depth-scaled init (GPT-2 §2.3).
+        self.down._is_residual_out = True
+        if activation == "relu2":
+            self.act = lambda t: F.relu(t).square()
+        elif activation == "gelu":
+            self.act = F.gelu
+        else:
+            raise ValueError(f"unknown mlp_activation for GatedMLP: {activation!r}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(self.act(self.up(x)))
+
+
+def build_mlp(cfg: RalphConfig) -> nn.Module:
+    if cfg.mlp_activation == "swiglu":
+        return SwiGLU(cfg)
+    if cfg.mlp_activation in ("relu2", "gelu"):
+        return GatedMLP(cfg, cfg.mlp_activation)
+    raise ValueError(f"unknown mlp_activation: {cfg.mlp_activation!r}")
+
+
 class Block(nn.Module):
     def __init__(self, cfg: RalphConfig):
         super().__init__()
         self.attn_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.attn = Attention(cfg)
         self.ffn_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
-        self.ffn = SwiGLU(cfg)
+        self.ffn = build_mlp(cfg)
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.attn_norm(x), rope_cache)
@@ -151,6 +207,12 @@ class RalphBase(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.tok_embed = nn.Embedding(cfg.vocab_size, cfg.dim)
+        # Learned absolute position embedding (GPT-2 style) only when selected;
+        # default "rope" leaves this None so the baseline is byte-identical.
+        if cfg.pos_encoding == "learned":
+            self.pos_embed = nn.Embedding(cfg.max_seq_len, cfg.dim)
+        else:
+            self.pos_embed = None
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
         self.final_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         if cfg.tie_embeddings:
@@ -169,7 +231,8 @@ class RalphBase(nn.Module):
             std = self.cfg.init_std
             # Scale residual-path output projections by 1/sqrt(2 * n_layers) so
             # that residual stream variance stays ~constant at init (GPT-2 §2.3).
-            if getattr(module, "_is_residual_out", False):
+            # Disabled when residual_init_scale=False -> plain init_std.
+            if self.cfg.residual_init_scale and getattr(module, "_is_residual_out", False):
                 std = std / math.sqrt(2 * self.cfg.n_layers)
             nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
@@ -186,6 +249,10 @@ class RalphBase(nn.Module):
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert idx.shape[-1] <= self.cfg.max_seq_len, f"sequence {idx.shape[-1]} exceeds max_seq_len {self.cfg.max_seq_len}"
         x = self.tok_embed(idx)
+        if self.pos_embed is not None:
+            T = idx.shape[-1]
+            pos = torch.arange(T, device=idx.device)
+            x = x + self.pos_embed(pos)
         for block in self.blocks:
             x = block(x, self.rope_cache)
         x = self.final_norm(x)
