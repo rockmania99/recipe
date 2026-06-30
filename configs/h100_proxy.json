@@ -12,7 +12,7 @@
   "micro_batch_size": 128,
   "total_steps": 2400,
   "warmup_steps": 240,
-  "max_lr": 0.0006,
+  "max_lr": 0.0008,
   "min_lr": 3e-05,
   "weight_decay": 0.1,
   "beta1": 0.9,
