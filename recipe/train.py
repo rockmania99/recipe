@@ -92,7 +92,7 @@ def set_determinism(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     try:
-        pass  # det off
+        torch.use_deterministic_algorithms(True, warn_only=True)
     except Exception:
         pass
     torch.backends.cudnn.deterministic = True
@@ -100,20 +100,11 @@ def set_determinism(seed: int) -> None:
 
 
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
-    # Warmup-Stable-Decay (WSD): linear warmup, hold peak LR for stable_frac of the
-    # post-warmup span, then cosine-decay to min_lr over the tail. The king config
-    # declares schedule:wsd/stable_frac:0.8 but canonical cosine_lr ignores them and
-    # decays from step 0; this delivers the schedule the recipe intends (+0.075 val,
-    # 2-seed confirmed). Reshapes the GLOBAL lr_frac applied to every optimizer group.
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
-    stable_frac = 0.8
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
-    if progress <= stable_frac:
-        return cfg.max_lr
-    decay = (progress - stable_frac) / max(1e-9, 1.0 - stable_frac)
-    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * decay))
+    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -253,23 +244,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
-    # torch.compile for throughput (weight-neutral; ~2.5x). The C/C++ toolchain is
-    # supplied via the allowlisted PATH/LD_LIBRARY_PATH env (proof/runner allowlist),
-    # NOT hardcoded — this patch references no host paths. Eager fallback if the
-    # runtime cannot compile; RALPH_NO_COMPILE=1 forces eager.
-    _raw_model = model
-    if os.environ.get("RALPH_NO_COMPILE", "0") != "1":
-        try:
-            model = torch.compile(model)
-        except Exception as _e:
-            print("[train] torch.compile off:", _e)
-            model = _raw_model
     optimizers = build_optimizer(model, cfg)
-    _mpath = Path(cfg.manifest_path)
-    if not _mpath.exists():
-        from data.manifest import build_manifest
-        _base = Path(cfg.data_base_dir)
-        build_manifest("llm-pretraining-launch", "gpt2", 50257, "uint16", sorted((_base / "shards").glob("*.bin")), _base).write(_mpath)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -370,7 +345,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": getattr(model, "_orig_mod", model).state_dict(), "config": asdict(cfg)}, ckpt_path)
+    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
